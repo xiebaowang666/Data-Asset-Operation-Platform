@@ -1,6 +1,6 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import sum as _sum, col, from_json
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+from pyspark.sql.functions import sum as _sum, col, from_json, when
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import RandomForestRegressor
 from pyspark.ml.evaluation import RegressionEvaluator
@@ -11,7 +11,7 @@ import matplotlib.font_manager as fm
 import numpy as np
 import pandas as pd
 
-# 创建 SparkSession 时指定 JAR 包路径，补充新增的两个 jar 包路径
+# 创建 SparkSession 时指定 JAR 包路径
 spark = SparkSession.builder \
     .appName("KafkaConsumerBatchExample") \
     .config("spark.jars", "/home/hadoop/spark/jars/spark-sql-kafka-0-10_2.12-3.5.5.jar,/home/hadoop/spark/jars/kafka-clients-3.4.1.jar,/home/hadoop/spark/jars/spark-token-provider-kafka-0-10_2.12-3.5.5.jar,/home/hadoop/spark/jars/commons-pool2-2.11.1.jar,/home/hadoop/spark/jars/spark-streaming-kafka-0-10_2.12-3.5.5.jar,/home/hadoop/spark/jars/kafka_2.12-3.6.1.jar") \
@@ -28,7 +28,7 @@ kafka_params = {
     "failOnDataLoss": "false"  # 忽略数据丢失错误
 }
 
-# 从 Kafka 读取数据（批处理模式，使用 read 而不是 readStream）
+# 从 Kafka 读取数据
 df = spark.read \
     .format("kafka") \
     .options(**kafka_params) \
@@ -38,7 +38,7 @@ df = spark.read \
 print("原始数据结构:")
 df.printSchema()
 
-# 定义新的 JSON 消息结构
+# 定义 JSON 消息结构
 json_schema = StructType([
     StructField("ID", StringType()),
     StructField("年份", StringType()),
@@ -67,16 +67,26 @@ parsed_df = df.selectExpr("CAST(key AS STRING)", "CAST(value AS STRING)") \
 print("解析后的数据结构:")
 parsed_df.printSchema()
 
-# 输出到控制台（批处理模式直接展示数据，可根据需要调整输出方式，比如写入文件等）
+# 输出到控制台
 print("解析后的数据内容:")
 parsed_df.show(truncate=False)
 
-# 将需要的列转换为整数类型
-parsed_df = parsed_df.withColumn("专利申请总量", col("专利申请总量").cast(IntegerType()))
-parsed_df = parsed_df.withColumn("专利申请_发明专利", col("专利申请_发明专利").cast(IntegerType()))
-parsed_df = parsed_df.withColumn("专利申请_实用新型", col("专利申请_实用新型").cast(IntegerType()))
-parsed_df = parsed_df.withColumn("专利申请_外观设计", col("专利申请_外观设计").cast(IntegerType()))
-parsed_df = parsed_df.withColumn("专利授权总量", col("专利授权总量").cast(IntegerType()))
+# ----------------------- 处理NaN及类型转换 -----------------------
+# 先转为Double类型（保留小数处理能力），并处理NaN（默认转为NULL）
+numeric_cols = [
+    "专利申请总量", "专利申请_发明专利", "专利申请_实用新型", "专利申请_外观设计",
+    "专利授权总量", "专利授权_发明专利", "专利授权_实用新型", "专利授权_外观设计"
+]
+
+for col_name in numeric_cols:
+    parsed_df = parsed_df.withColumn(col_name, col(col_name).cast(DoubleType()))
+
+# 使用when条件将NULL值转换为0（保留原始数据类型为Double）
+for col_name in numeric_cols:
+    parsed_df = parsed_df.withColumn(
+        col_name,
+        when(col(col_name).isNull(), 0.0).otherwise(col(col_name))
+    )
 
 # 指定中文字体路径
 font_path = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
@@ -140,7 +150,7 @@ try:
     plt.savefig(os.path.join(save_dir, "annual_patent_trend.png"))
     plt.close()
 
-    # ---------------------- 2. 数据可视化 - 类型占比分析（修改为总年占比） ----------------------
+    # ---------------------- 2. 数据可视化 - 类型占比分析 ----------------------
     # 计算所有年份的专利类型总量
     total_type = parsed_df.agg(
         _sum("专利申请_发明专利").alias("发明专利"),
@@ -256,15 +266,13 @@ try:
     plt.savefig(os.path.join(save_dir, "prediction_vs_actual.png"))
     plt.close()
 
-    # 特征重要性分析（修复SparseVector排序问题）
+    # 特征重要性分析
     feature_importance = best_rf.featureImportances
-    # 将SparseVector转换为密集数组
     importance_array = feature_importance.toArray()
     importance_pd = pd.DataFrame({
         "特征": feature_cols,
         "重要性": importance_array
     })
-    # 按重要性降序排序
     importance_pd = importance_pd.sort_values("重要性", ascending=False)
 
     # 绘制特征重要性柱状图
